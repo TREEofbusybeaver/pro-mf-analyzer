@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 from mftool import Mftool
 import datetime
 from scipy.optimize import brentq
@@ -38,6 +40,115 @@ def inflation_adjusted_value(nominal_value, inflation_rate, years):
     if years <= 0 or inflation_rate <= 0:
         return nominal_value
     return nominal_value / ((1 + inflation_rate / 100) ** years)
+
+
+def calculate_rolling_returns(df, window_years=3):
+    """Calculate rolling CAGR for every possible window_years-length period."""
+    window_days = int(window_years * 365.25)
+    results = []
+    nav_series = df['nav']
+    dates = df.index
+    for i in range(len(dates)):
+        start_date = dates[i]
+        end_date = start_date + pd.Timedelta(days=window_days)
+        future_dates = dates[dates >= end_date]
+        if len(future_dates) == 0:
+            break
+        actual_end = future_dates[0]
+        start_nav = nav_series.iloc[i]
+        end_nav = nav_series.loc[actual_end]
+        actual_years = (actual_end - start_date).days / 365.25
+        if actual_years > 0 and start_nav > 0:
+            cagr = ((end_nav / start_nav) ** (1 / actual_years) - 1) * 100
+            results.append({'date': start_date, 'cagr': cagr})
+    if not results:
+        return pd.DataFrame(columns=['date', 'cagr']), {}
+    rolling_df = pd.DataFrame(results)
+    summary = {
+        'avg': rolling_df['cagr'].mean(),
+        'median': rolling_df['cagr'].median(),
+        'min': rolling_df['cagr'].min(),
+        'max': rolling_df['cagr'].max(),
+        'min_date': rolling_df.loc[rolling_df['cagr'].idxmin(), 'date'],
+        'max_date': rolling_df.loc[rolling_df['cagr'].idxmax(), 'date'],
+        'positive_pct': (rolling_df['cagr'] > 0).mean() * 100,
+        'window_years': window_years,
+        'total_periods': len(rolling_df)
+    }
+    return rolling_df, summary
+
+
+def calculate_drawdown(df):
+    """Calculate drawdown series from a NAV DataFrame."""
+    nav = df['nav']
+    running_max = nav.cummax()
+    drawdown_pct = ((nav - running_max) / running_max) * 100
+    dd_df = pd.DataFrame({
+        'nav': nav, 'peak_nav': running_max, 'drawdown_pct': drawdown_pct
+    }, index=df.index)
+    max_dd_idx = drawdown_pct.idxmin()
+    max_dd_value = drawdown_pct.min()
+    peak_date = nav[:max_dd_idx].idxmax() if max_dd_idx is not None else None
+    peak_nav_at_dd = running_max.loc[max_dd_idx] if max_dd_idx is not None else None
+    recovery_date = None
+    if max_dd_idx is not None and peak_nav_at_dd is not None:
+        post_dd = nav[max_dd_idx:]
+        recovered = post_dd[post_dd >= peak_nav_at_dd]
+        if len(recovered) > 0:
+            recovery_date = recovered.index[0]
+    max_dd_info = {
+        'max_drawdown_pct': max_dd_value,
+        'drawdown_date': max_dd_idx,
+        'peak_date': peak_date,
+        'recovery_date': recovery_date,
+        'recovery_days': (recovery_date - max_dd_idx).days if recovery_date else None
+    }
+    return dd_df, max_dd_info
+
+
+def calculate_correlation_matrix(dfs_dict):
+    """Calculate Pearson correlation on daily returns between multiple funds."""
+    returns_dict = {}
+    for name, df in dfs_dict.items():
+        daily_returns = df['nav'].pct_change().dropna()
+        daily_returns.name = name
+        returns_dict[name] = daily_returns
+    if len(returns_dict) < 2:
+        return pd.DataFrame(), []
+    returns_df = pd.DataFrame(returns_dict).dropna()
+    if returns_df.empty:
+        return pd.DataFrame(), []
+    corr_matrix = returns_df.corr()
+    warnings = []
+    fund_names = list(dfs_dict.keys())
+    for i in range(len(fund_names)):
+        for j in range(i + 1, len(fund_names)):
+            corr_val = corr_matrix.loc[fund_names[i], fund_names[j]]
+            if corr_val > 0.85:
+                warnings.append(
+                    f"⚠️ **HIGH OVERLAP:** *{fund_names[i]}* and *{fund_names[j]}* "
+                    f"have **{corr_val:.1%}** correlation — they move almost identically. "
+                    f"Adding both provides limited diversification benefit."
+                )
+    return corr_matrix, warnings
+
+
+def goal_reverse_calculator(target_amount, years, cagr_pct):
+    """Reverse-calculate the required SIP or Lumpsum to reach a financial goal."""
+    monthly_rate = (1 + cagr_pct / 100) ** (1/12) - 1
+    total_months = int(years * 12)
+    required_lumpsum = target_amount / ((1 + cagr_pct / 100) ** years)
+    if monthly_rate > 0:
+        required_sip = target_amount / (((1 + monthly_rate) ** total_months - 1) / monthly_rate * (1 + monthly_rate))
+    else:
+        required_sip = target_amount / total_months
+    return {
+        'required_lumpsum': required_lumpsum,
+        'required_monthly_sip': required_sip,
+        'target': target_amount,
+        'years': years,
+        'cagr_used': cagr_pct
+    }
 
 # --- Initialize Global Tools & Caching ---
 @st.cache_resource
@@ -94,6 +205,22 @@ with st.sidebar:
     st.markdown("How much *extra* capital are you willing to invest to beat the Lumpsum profit?")
     multiplier_input = st.slider("Max Budget Limit", min_value=1.0, max_value=3.0, value=1.10, step=0.1, help="1.10 means Max SIP Budget is Lumpsum + 10%")
     
+    st.divider()
+
+    # --- Phase 2: Rolling Returns Window ---
+    st.subheader("📊 Rolling Returns")
+    rolling_window = st.selectbox("Rolling Return Window", options=[3, 5, 7, 10], index=0,
+                                   format_func=lambda x: f"{x}-Year Rolling", help="Window size for rolling CAGR analysis")
+    
+    # --- Phase 2: Goal Calculator ---
+    st.divider()
+    st.subheader("🎯 Goal Calculator")
+    goal_target = st.number_input("Target Amount (₹)", value=10000000, step=1000000, 
+                                   help="Enter your financial goal, e.g. ₹1,00,00,000 for 1 Crore")
+    goal_years = st.number_input("Time Horizon (Years)", value=10, min_value=1, max_value=40, step=1)
+
+    st.divider()
+
     st.header("🔍 Search & Add Funds")
     st.markdown("*Type a keyword (e.g., 'Flexi Cap', 'Quant', 'Silver') and select from the dropdown.*")
     
@@ -119,6 +246,7 @@ if analyze_button:
     else:
         with st.spinner("Crunching historical data and running analyzer..."):
             master_graph_data = pd.DataFrame()
+            correlation_dfs = {}  # Phase 2: collect DataFrames for correlation
 
             for code in scheme_codes:
                 df = fetch_mf_data(code)
@@ -129,6 +257,9 @@ if analyze_button:
                     df_filtered = df.loc[mask]
                     
                     if not df_filtered.empty:
+                        # Store for correlation analysis
+                        correlation_dfs[fund_name] = df_filtered.copy()
+
                         st.subheader(f"📊 {fund_name}")
                         
                         start_nav = df_filtered.iloc[0]['nav']
@@ -207,6 +338,8 @@ if analyze_button:
                             # SIP Inflation-Adjusted
                             sip_real_value = inflation_adjusted_value(sip_final_value, inflation_rate, investment_years)
 
+                            # ===== PHASE 1 METRICS =====
+
                             # --- Metrics Row 1: Core ---
                             st.markdown("##### Core Metrics")
                             col1, col2, col3 = st.columns(3)
@@ -277,7 +410,104 @@ if analyze_button:
                             else:
                                 master_graph_data = master_graph_data.join(df_graph[cols_to_keep], how='outer')
 
-                            # --- 3. OPTIMAL SIP ANALYZER ---
+                            # ===== PHASE 2: ROLLING RETURNS =====
+                            with st.expander("📊 Rolling Returns Analysis", expanded=False):
+                                # Use full historical data for richer rolling returns
+                                rolling_df, r_summary = calculate_rolling_returns(df, window_years=rolling_window)
+                                if r_summary:
+                                    rc1, rc2, rc3, rc4 = st.columns(4)
+                                    rc1.metric(f"Avg {rolling_window}Y CAGR", f"{r_summary['avg']:.2f}%")
+                                    rc2.metric("Best Period", f"{r_summary['max']:.2f}%", 
+                                               f"from {r_summary['max_date'].strftime('%b %Y')}")
+                                    rc3.metric("Worst Period", f"{r_summary['min']:.2f}%", 
+                                               f"from {r_summary['min_date'].strftime('%b %Y')}")
+                                    rc4.metric("% Positive Periods", f"{r_summary['positive_pct']:.1f}%",
+                                               f"of {r_summary['total_periods']} periods")
+                                    
+                                    # Rolling returns chart
+                                    fig_rolling = go.Figure()
+                                    fig_rolling.add_trace(go.Scatter(
+                                        x=rolling_df['date'], y=rolling_df['cagr'],
+                                        mode='lines', name=f'{rolling_window}Y Rolling CAGR',
+                                        line=dict(color='#6366f1', width=1.5),
+                                        fill='tozeroy',
+                                        fillcolor='rgba(99,102,241,0.15)'
+                                    ))
+                                    fig_rolling.add_hline(y=r_summary['avg'], line_dash="dash", 
+                                                          line_color="orange", annotation_text=f"Avg: {r_summary['avg']:.1f}%")
+                                    fig_rolling.add_hline(y=0, line_color="red", line_width=1)
+                                    fig_rolling.update_layout(
+                                        title=f"{rolling_window}-Year Rolling CAGR Over Time",
+                                        xaxis_title="Start Date of Period",
+                                        yaxis_title="CAGR (%)",
+                                        hovermode="x unified",
+                                        height=400
+                                    )
+                                    st.plotly_chart(fig_rolling, use_container_width=True)
+                                else:
+                                    st.warning(f"Insufficient data for {rolling_window}-year rolling returns. Need at least {rolling_window}+ years of history.")
+
+                            # ===== PHASE 2: DRAWDOWN VISUALIZER =====
+                            with st.expander("📉 Drawdown Analysis", expanded=False):
+                                dd_df, max_dd = calculate_drawdown(df_filtered)
+                                
+                                dc1, dc2, dc3 = st.columns(3)
+                                dc1.metric("Max Drawdown", f"{max_dd['max_drawdown_pct']:.2f}%")
+                                if max_dd['peak_date'] and max_dd['drawdown_date']:
+                                    dc2.metric("Peak → Bottom", 
+                                               f"{max_dd['peak_date'].strftime('%d %b %Y')} → {max_dd['drawdown_date'].strftime('%d %b %Y')}")
+                                if max_dd['recovery_date']:
+                                    dc3.metric("Recovery Time", f"{max_dd['recovery_days']} days",
+                                               f"Recovered {max_dd['recovery_date'].strftime('%d %b %Y')}")
+                                else:
+                                    dc3.metric("Recovery", "NOT YET", "Still underwater")
+
+                                # Drawdown chart
+                                fig_dd = go.Figure()
+                                fig_dd.add_trace(go.Scatter(
+                                    x=dd_df.index, y=dd_df['drawdown_pct'],
+                                    mode='lines', name='Drawdown %',
+                                    line=dict(color='#ef4444', width=1.5),
+                                    fill='tozeroy',
+                                    fillcolor='rgba(239,68,68,0.2)'
+                                ))
+                                fig_dd.update_layout(
+                                    title="Drawdown From Peak",
+                                    xaxis_title="Date",
+                                    yaxis_title="Drawdown (%)",
+                                    hovermode="x unified",
+                                    height=350
+                                )
+                                st.plotly_chart(fig_dd, use_container_width=True)
+
+                            # ===== PHASE 2: GOAL-BASED CALCULATOR =====
+                            with st.expander("🎯 Goal-Based Reverse Calculator", expanded=False):
+                                # Use Lumpsum CAGR as the projected rate
+                                fund_cagr = ls_xirr if ls_xirr and ls_xirr > 0 else None
+                                if fund_cagr:
+                                    goal = goal_reverse_calculator(goal_target, goal_years, fund_cagr)
+                                    
+                                    st.markdown(f"**Goal:** ₹{goal_target:,.0f} in **{goal_years} years** using this fund's **{fund_cagr:.2f}% CAGR**")
+                                    
+                                    gc1, gc2 = st.columns(2)
+                                    gc1.metric("Required One-Time Lumpsum", f"₹{goal['required_lumpsum']:,.0f}")
+                                    gc2.metric("Required Monthly SIP", f"₹{goal['required_monthly_sip']:,.0f}")
+                                    
+                                    # Show a helpful table for multiple horizons
+                                    goal_rows = []
+                                    for yr in [5, 10, 15, 20, 25]:
+                                        g = goal_reverse_calculator(goal_target, yr, fund_cagr)
+                                        goal_rows.append({
+                                            'Horizon': f'{yr} Years',
+                                            'Required Lumpsum': f"₹{g['required_lumpsum']:,.0f}",
+                                            'Required Monthly SIP': f"₹{g['required_monthly_sip']:,.0f}"
+                                        })
+                                    st.markdown(f"**Sensitivity Table** — How much you need for ₹{goal_target/10000000:.1f} Cr at {fund_cagr:.1f}% CAGR:")
+                                    st.dataframe(pd.DataFrame(goal_rows).set_index('Horizon'), use_container_width=True)
+                                else:
+                                    st.warning("Cannot compute goal — Fund CAGR is unavailable or negative for this period.")
+
+                            # --- 3. OPTIMAL SIP ANALYZER (Phase 1) ---
                             with st.expander("🤖 Open Optimal SIP Analyzer Results"):
                                 max_sip_total = total_lumpsum * multiplier_input
                                 max_monthly_sip = max_sip_total / months
@@ -316,6 +546,47 @@ if analyze_button:
                                     st.error(f"No SIP strategy within a {multiplier_input}x budget (Max ₹{max_sip_total:,.0f}) could beat the Lumpsum profit for this specific timeframe.")
                         else:
                             st.write("Timeframe too short for SIP.")
+
+            # ===== PHASE 2: CORRELATION MATRIX (Multi-Fund) =====
+            if len(correlation_dfs) >= 2:
+                st.divider()
+                st.subheader("🔗 Portfolio Overlap / Correlation Analysis")
+                
+                corr_matrix, overlap_warnings = calculate_correlation_matrix(correlation_dfs)
+                
+                if not corr_matrix.empty:
+                    # Warnings first
+                    for warning in overlap_warnings:
+                        st.warning(warning)
+                    
+                    if not overlap_warnings:
+                        st.success("✅ Good diversification! No high-overlap pairs detected (all correlations below 85%).")
+                    
+                    # Truncate long fund names for display
+                    short_names = [n[:30] + "..." if len(n) > 30 else n for n in corr_matrix.columns]
+                    
+                    # Heatmap
+                    fig_corr = go.Figure(data=go.Heatmap(
+                        z=corr_matrix.values,
+                        x=short_names,
+                        y=short_names,
+                        colorscale='RdBu_r',
+                        zmin=-1, zmax=1,
+                        text=corr_matrix.round(3).values,
+                        texttemplate="%{text:.3f}",
+                        textfont={"size": 12},
+                        hoverongaps=False
+                    ))
+                    fig_corr.update_layout(
+                        title="Daily Returns Correlation Matrix",
+                        height=450,
+                        xaxis=dict(tickangle=45)
+                    )
+                    st.plotly_chart(fig_corr, use_container_width=True)
+                    
+                    st.caption("**Interpretation:** Values close to +1.0 mean the funds move together (high overlap). "
+                               "Values near 0 mean they are independent (good diversification). "
+                               "Values near -1.0 mean they move oppositely (natural hedge).")
 
             # --- Master Graph UI ---
             if not master_graph_data.empty:

@@ -1,5 +1,6 @@
 from mftool import Mftool
 import pandas as pd
+import numpy as np
 import sys
 from scipy.optimize import brentq
 from datetime import datetime
@@ -53,6 +54,159 @@ def inflation_adjusted_value(nominal_value, inflation_rate, years):
     if years <= 0 or inflation_rate <= 0:
         return nominal_value
     return nominal_value / ((1 + inflation_rate / 100) ** years)
+
+
+def calculate_rolling_returns(df, window_years=3):
+    """
+    Calculate rolling CAGR for every possible window_years-length period.
+    df: DataFrame with DatetimeIndex and 'nav' column.
+    Returns: DataFrame with columns ['date', 'cagr'], plus summary dict.
+    """
+    window_days = int(window_years * 365.25)
+    results = []
+    
+    nav_series = df['nav']
+    dates = df.index
+    
+    for i in range(len(dates)):
+        start_date = dates[i]
+        end_date = start_date + pd.Timedelta(days=window_days)
+        
+        # Find the closest available date at or after end_date
+        future_dates = dates[dates >= end_date]
+        if len(future_dates) == 0:
+            break
+        
+        actual_end = future_dates[0]
+        start_nav = nav_series.iloc[i]
+        end_nav = nav_series.loc[actual_end]
+        
+        actual_years = (actual_end - start_date).days / 365.25
+        if actual_years > 0 and start_nav > 0:
+            cagr = ((end_nav / start_nav) ** (1 / actual_years) - 1) * 100
+            results.append({'date': start_date, 'cagr': cagr})
+    
+    if not results:
+        return pd.DataFrame(columns=['date', 'cagr']), {}
+    
+    rolling_df = pd.DataFrame(results)
+    summary = {
+        'avg': rolling_df['cagr'].mean(),
+        'median': rolling_df['cagr'].median(),
+        'min': rolling_df['cagr'].min(),
+        'max': rolling_df['cagr'].max(),
+        'min_date': rolling_df.loc[rolling_df['cagr'].idxmin(), 'date'],
+        'max_date': rolling_df.loc[rolling_df['cagr'].idxmax(), 'date'],
+        'positive_pct': (rolling_df['cagr'] > 0).mean() * 100,
+        'window_years': window_years,
+        'total_periods': len(rolling_df)
+    }
+    return rolling_df, summary
+
+
+def calculate_drawdown(df):
+    """
+    Calculate drawdown series from a NAV DataFrame.
+    Returns: DataFrame with 'drawdown_pct' column, and max drawdown dict.
+    """
+    nav = df['nav']
+    running_max = nav.cummax()
+    drawdown_pct = ((nav - running_max) / running_max) * 100  # negative values
+    
+    dd_df = pd.DataFrame({
+        'nav': nav,
+        'peak_nav': running_max,
+        'drawdown_pct': drawdown_pct
+    }, index=df.index)
+    
+    max_dd_idx = drawdown_pct.idxmin()
+    max_dd_value = drawdown_pct.min()
+    
+    # Find the peak date before the max drawdown
+    peak_date = nav[:max_dd_idx].idxmax() if max_dd_idx is not None else None
+    
+    # Find recovery date (when NAV crosses above peak again)
+    peak_nav_at_dd = running_max.loc[max_dd_idx] if max_dd_idx is not None else None
+    recovery_date = None
+    if max_dd_idx is not None and peak_nav_at_dd is not None:
+        post_dd = nav[max_dd_idx:]
+        recovered = post_dd[post_dd >= peak_nav_at_dd]
+        if len(recovered) > 0:
+            recovery_date = recovered.index[0]
+    
+    max_dd_info = {
+        'max_drawdown_pct': max_dd_value,
+        'drawdown_date': max_dd_idx,
+        'peak_date': peak_date,
+        'recovery_date': recovery_date,
+        'recovery_days': (recovery_date - max_dd_idx).days if recovery_date else None
+    }
+    return dd_df, max_dd_info
+
+
+def calculate_correlation_matrix(dfs_dict):
+    """
+    Calculate Pearson correlation on daily returns between multiple funds.
+    dfs_dict: {fund_name: DataFrame with 'nav' column}
+    Returns: correlation DataFrame, list of high-overlap warning strings.
+    """
+    returns_dict = {}
+    for name, df in dfs_dict.items():
+        daily_returns = df['nav'].pct_change().dropna()
+        daily_returns.name = name
+        returns_dict[name] = daily_returns
+    
+    if len(returns_dict) < 2:
+        return pd.DataFrame(), []
+    
+    # Align all return series on common dates
+    returns_df = pd.DataFrame(returns_dict)
+    returns_df = returns_df.dropna()
+    
+    if returns_df.empty:
+        return pd.DataFrame(), []
+    
+    corr_matrix = returns_df.corr()
+    
+    # Find highly correlated pairs
+    warnings = []
+    fund_names = list(dfs_dict.keys())
+    for i in range(len(fund_names)):
+        for j in range(i + 1, len(fund_names)):
+            corr_val = corr_matrix.loc[fund_names[i], fund_names[j]]
+            if corr_val > 0.85:
+                warnings.append(
+                    f"⚠️ HIGH OVERLAP: '{fund_names[i]}' and '{fund_names[j]}' "
+                    f"have {corr_val:.1%} correlation — they move almost identically. "
+                    f"Adding both provides limited diversification benefit."
+                )
+    return corr_matrix, warnings
+
+
+def goal_reverse_calculator(target_amount, years, cagr_pct):
+    """
+    Reverse-calculate the required SIP or Lumpsum to reach a financial goal.
+    Returns dict with 'required_lumpsum' and 'required_monthly_sip'.
+    """
+    monthly_rate = (1 + cagr_pct / 100) ** (1/12) - 1
+    total_months = int(years * 12)
+    
+    # Required Lumpsum: PV = FV / (1 + r)^n
+    required_lumpsum = target_amount / ((1 + cagr_pct / 100) ** years)
+    
+    # Required SIP: FV = P * [((1+r)^n - 1) / r] * (1+r)  (annuity due, invest at start of month)
+    if monthly_rate > 0:
+        required_sip = target_amount / (((1 + monthly_rate) ** total_months - 1) / monthly_rate * (1 + monthly_rate))
+    else:
+        required_sip = target_amount / total_months
+    
+    return {
+        'required_lumpsum': required_lumpsum,
+        'required_monthly_sip': required_sip,
+        'target': target_amount,
+        'years': years,
+        'cagr_used': cagr_pct
+    }
 
 
 def compare_strategies(scheme_code, start_date, end_date, total_lumpsum, monthly_sip,
@@ -306,6 +460,65 @@ def compare_strategies(scheme_code, start_date, end_date, total_lumpsum, monthly
             print(f"  Capital Efficiency:       FAIR. You beat Lumpsum profit, but had to invest ₹{extra_cost:,.2f} MORE total capital (within the {budget_multiplier * 100 - 100:.0f}% limit).")
     else:
         print(f"  Result:                   No SIP strategy within a +{budget_multiplier * 100 - 100:.0f}% budget (Max ₹{max_sip_total:,.2f}) could beat the Lumpsum profit for this timeframe.")
+
+    # ==========================================
+    # 4. ROLLING RETURNS ANALYSIS (Phase 2)
+    # ==========================================
+    print("\n" + "="*65)
+    print("[ ROLLING RETURNS ANALYSIS ]")
+    print("="*65)
+    
+    for window in [3, 5]:
+        rolling_df, summary = calculate_rolling_returns(df, window_years=window)
+        if summary:
+            print(f"\n  {window}-Year Rolling CAGR:")
+            print(f"    Average:        {summary['avg']:.2f}%")
+            print(f"    Median:         {summary['median']:.2f}%")
+            print(f"    Best:           {summary['max']:.2f}%  (starting {summary['max_date'].strftime('%Y-%m-%d')})")
+            print(f"    Worst:          {summary['min']:.2f}%  (starting {summary['min_date'].strftime('%Y-%m-%d')})")
+            print(f"    % Positive:     {summary['positive_pct']:.1f}% of {summary['total_periods']} periods")
+        else:
+            print(f"\n  {window}-Year Rolling CAGR: Insufficient data (need {window}+ years of history)")
+
+    # ==========================================
+    # 5. DRAWDOWN ANALYSIS (Phase 2)
+    # ==========================================
+    print("\n" + "="*65)
+    print("[ DRAWDOWN ANALYSIS ]")
+    print("="*65)
+    
+    dd_df, max_dd = calculate_drawdown(df_filtered)
+    print(f"\n  Max Drawdown:             {max_dd['max_drawdown_pct']:.2f}%")
+    if max_dd['peak_date']:
+        print(f"  Peak Date:                {max_dd['peak_date'].strftime('%Y-%m-%d')}")
+    if max_dd['drawdown_date']:
+        print(f"  Bottom Date:              {max_dd['drawdown_date'].strftime('%Y-%m-%d')}")
+    if max_dd['recovery_date']:
+        print(f"  Recovery Date:            {max_dd['recovery_date'].strftime('%Y-%m-%d')}")
+        print(f"  Recovery Time:            {max_dd['recovery_days']} days")
+    else:
+        print(f"  Recovery:                 NOT YET RECOVERED")
+
+    # ==========================================
+    # 6. GOAL-BASED REVERSE CALCULATOR (Phase 2)
+    # ==========================================
+    print("\n" + "="*65)
+    print("[ GOAL-BASED REVERSE CALCULATOR ]")
+    print("="*65)
+    
+    # Use Lumpsum CAGR as the projected rate
+    if ls_xirr is not None and ls_xirr > 0:
+        for target_cr in [0.5, 1.0, 2.0]:
+            target_amt = target_cr * 10000000  # Convert crores to rupees
+            for horizon in [10, 15, 20]:
+                goal = goal_reverse_calculator(target_amt, horizon, ls_xirr)
+                print(f"\n  Goal: ₹{target_cr:.1f} Cr in {horizon} years (at {ls_xirr:.2f}% CAGR)")
+                print(f"    Required Lumpsum:       ₹{goal['required_lumpsum']:,.0f}")
+                print(f"    Required Monthly SIP:   ₹{goal['required_monthly_sip']:,.0f}")
+    else:
+        print("  Cannot compute — CAGR data unavailable.")
+    
+    print("\n" + "="*65 + "\n")
 
 
 # Inputs: Scheme Code, Start Date, End Date, Lumpsum Amount, Monthly SIP Amount, Step-Up %, Inflation %
